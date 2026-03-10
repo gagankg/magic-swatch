@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: Inter, system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      padding: 20px;
+      background: #fafafa;
+    }
+    h3 {
+      font-size: 14px;
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 6px;
+    }
+    p {
+      font-size: 11px;
+      color: #888;
+      margin-bottom: 20px;
+      text-align: center;
+      line-height: 1.4;
+    }
+    button {
+      background: #18A0FB;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 10px 28px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button:hover { background: #0d8de5; }
+    button:disabled { background: #bbb; cursor: not-allowed; }
+    #status {
+      margin-top: 14px;
+      font-size: 11px;
+      color: #666;
+      min-height: 16px;
+    }
+  </style>
+</head>
+<body>
+  <h3>Magic Swatches</h3>
+  <p>Select an image frame, then extract<br>its 5 dominant colors as swatches.</p>
+  <button id="btn" onclick="extract()">Extract Swatches</button>
+  <div id="status"></div>
+
+  <script>
+    var btn = document.getElementById('btn');
+    var status = document.getElementById('status');
+
+    function extract() {
+      parent.postMessage({ pluginMessage: { type: 'extract' } }, '*');
+      status.textContent = 'Analyzing image\u2026';
+      btn.disabled = true;
+    }
+
+    onmessage = function (event) {
+      var msg = event.data.pluginMessage;
+      if (!msg) return;
+
+      if (msg.type === 'error') {
+        status.textContent = msg.message;
+        btn.disabled = false;
+        return;
+      }
+
+      if (msg.type === 'image') {
+        processImage(new Uint8Array(msg.bytes));
+      }
+    };
+
+    function processImage(bytes) {
+      var blob = new Blob([bytes], { type: 'image/png' });
+      var url = URL.createObjectURL(blob);
+      var img = new Image();
+
+      img.onload = function () {
+        var canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        var ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+
+        var imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        var pixels = samplePixels(imageData, 10);
+
+        if (pixels.length === 0) {
+          status.textContent = 'No visible pixels found.';
+          btn.disabled = false;
+          return;
+        }
+
+        var colors = extractColors(pixels, 5);
+        parent.postMessage({ pluginMessage: { type: 'colors', colors: colors } }, '*');
+        URL.revokeObjectURL(url);
+      };
+
+      img.onerror = function () {
+        status.textContent = 'Failed to decode image.';
+        btn.disabled = false;
+      };
+
+      img.src = url;
+    }
+
+    /* --- Pixel sampling --- */
+
+    function samplePixels(imageData, step) {
+      var pixels = [];
+      var d = imageData.data;
+      var w = imageData.width;
+      var h = imageData.height;
+
+      for (var y = 0; y < h; y += step) {
+        for (var x = 0; x < w; x += step) {
+          var i = (y * w + x) * 4;
+          if (d[i + 3] < 128) continue;
+          pixels.push([d[i], d[i + 1], d[i + 2]]);
+        }
+      }
+      return pixels;
+    }
+
+    /* --- Color math --- */
+
+    function dist(a, b) {
+      var dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+      return Math.sqrt(dr * dr + dg * dg + db * db);
+    }
+
+    /* --- K-means with k-means++ init --- */
+
+    function kMeans(pixels, k, maxIter) {
+      if (!maxIter) maxIter = 20;
+      if (pixels.length <= k) {
+        return pixels.map(function (p) { return { color: p, count: 1 }; });
+      }
+
+      // k-means++ initialization
+      var centroids = [pixels[Math.floor(Math.random() * pixels.length)].slice()];
+
+      for (var c = 1; c < k; c++) {
+        var distances = pixels.map(function (p) {
+          var minD = Infinity;
+          for (var j = 0; j < centroids.length; j++) {
+            var d = dist(p, centroids[j]);
+            if (d < minD) minD = d;
+          }
+          return minD * minD;
+        });
+        var total = 0;
+        for (var t = 0; t < distances.length; t++) total += distances[t];
+        var r = Math.random() * total;
+        for (var j = 0; j < pixels.length; j++) {
+          r -= distances[j];
+          if (r <= 0) { centroids.push(pixels[j].slice()); break; }
+        }
+        if (centroids.length <= c) {
+          centroids.push(pixels[Math.floor(Math.random() * pixels.length)].slice());
+        }
+      }
+
+      // Iterate
+      var clusters;
+      for (var iter = 0; iter < maxIter; iter++) {
+        clusters = [];
+        for (var i = 0; i < k; i++) clusters.push([]);
+
+        for (var pi = 0; pi < pixels.length; pi++) {
+          var minD = Infinity, minIdx = 0;
+          for (var ci = 0; ci < k; ci++) {
+            var d = dist(pixels[pi], centroids[ci]);
+            if (d < minD) { minD = d; minIdx = ci; }
+          }
+          clusters[minIdx].push(pixels[pi]);
+        }
+
+        var converged = true;
+        for (var i = 0; i < k; i++) {
+          if (clusters[i].length === 0) continue;
+          var avg = [0, 0, 0];
+          for (var j = 0; j < clusters[i].length; j++) {
+            avg[0] += clusters[i][j][0];
+            avg[1] += clusters[i][j][1];
+            avg[2] += clusters[i][j][2];
+          }
+          var nc = [
+            Math.round(avg[0] / clusters[i].length),
+            Math.round(avg[1] / clusters[i].length),
+            Math.round(avg[2] / clusters[i].length)
+          ];
+          if (dist(nc, centroids[i]) > 1) converged = false;
+          centroids[i] = nc;
+        }
+        if (converged) break;
+      }
+
+      return centroids.map(function (c, i) {
+        return { color: c, count: clusters[i].length };
+      });
+    }
+
+    /* --- Extract dominant colors --- */
+
+    function extractColors(pixels, k) {
+      var results = kMeans(pixels, k);
+
+      // Filter near-duplicate colors (distance < 30)
+      var filtered = [];
+      for (var i = 0; i < results.length; i++) {
+        var isDup = false;
+        for (var j = 0; j < filtered.length; j++) {
+          if (dist(results[i].color, filtered[j].color) < 30) { isDup = true; break; }
+        }
+        if (!isDup) filtered.push(results[i]);
+      }
+
+      // Sort by frequency descending
+      filtered.sort(function (a, b) { return b.count - a.count; });
+
+      return filtered.slice(0, 5).map(function (item) {
+        var c = item.color;
+        return {
+          r: c[0],
+          g: c[1],
+          b: c[2],
+          hex: '#' + toHex(c[0]) + toHex(c[1]) + toHex(c[2])
+        };
+      });
+    }
+
+    function toHex(n) {
+      var s = n.toString(16).toUpperCase();
+      return s.length < 2 ? '0' + s : s;
+    }
+  </script>
+</body>
+</html>
