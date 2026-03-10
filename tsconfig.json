@@ -3,7 +3,7 @@
     "target": "ES2017",
     "lib": ["ES2017"],
     "strict": true,
-    "typeRoots": ["./node_modules/@figma/plugin-typings"]
+    "typeRoots": ["./node_modules/@figma/plugin-typings", "./node_modules/@types"]
   },
-  "files": ["code.ts"]
+  "files": ["code.ts", "./node_modules/@figma/plugin-typings/index.d.ts"]
 }
